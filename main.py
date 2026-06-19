@@ -14,18 +14,31 @@ from fastapi.staticfiles import StaticFiles
 
 app = FastAPI()
 
-# --- COOKIE HANDLING ---
+# --- IMPROVED COOKIE HANDLING ---
+# This reads from the Render Env Var and ensures it formats correctly
 YT_COOKIES_STR = os.getenv("YT_COOKIES")
+COOKIE_PATH = "cookies.txt"
+
 if YT_COOKIES_STR:
-    with open("cookies.txt", "w") as f:
-        f.write(YT_COOKIES_STR)
+    # Clean up common formatting issues from copy-pasting into web UIs
+    cleaned_cookies = YT_COOKIES_STR.replace('\\n', '\n').strip('"').strip("'")
+    with open(COOKIE_PATH, "w", encoding="utf-8") as f:
+        f.write(cleaned_cookies)
+    print("LOG: Successfully wrote cookies.txt to disk.")
+else:
+    print("LOG: No YT_COOKIES environment variable found!")
 
 import sys as _sys
 import shutil as _shutil2
 
-_WIN_YTDLP = r"C:\Users\saxen\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\Scripts\yt-dlp.exe"
-YT_DLP = _WIN_YTDLP if _sys.platform == "win32" else (_shutil2.which("yt-dlp") or "yt-dlp")
+# Set binary path based on OS
+if _sys.platform == "win32":
+    YT_DLP = r"C:\Users\saxen\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\Scripts\yt-dlp.exe"
+else:
+    # On Render/Linux, 'yt-dlp' should be in the PATH
+    YT_DLP = _shutil2.which("yt-dlp") or "yt-dlp"
 
+# Temp dir for downloads
 TEMP_DIR = Path(tempfile.gettempdir()) / "ytdlp_serve"
 TEMP_DIR.mkdir(exist_ok=True)
 
@@ -38,27 +51,28 @@ def index():
 @app.get("/info")
 async def get_info(url: str):
     try:
-        # Added User-Agent and No-Check-Certificates here to help bypass blocks
+        # Added User-Agent and Certificates to match a real browser session
         cmd = [
             YT_DLP, 
-            "--cookies", "cookies.txt", 
+            "--cookies", COOKIE_PATH, 
             "--no-check-certificates",
             "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "-J", 
             "--no-playlist", 
             url
         ]
+        
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         
         if result.returncode != 0:
-            # THIS IS CRITICAL: This will show the real error in your Render Logs
-            print(f"DEBUG: yt-dlp error output: {result.stderr}")
-            return JSONResponse({"error": result.stderr or "Failed to fetch info"}, status_code=400)
+            # This prints the specific YouTube error to your Render Logs
+            print(f"ERROR from yt-dlp: {result.stderr}")
+            return JSONResponse({"error": result.stderr}, status_code=400)
 
         data = json.loads(result.stdout)
         formats = data.get("formats", [])
         video_formats, audio_formats = [], []
-        seen_video, seen_audio = set() , set()
+        seen_video, seen_audio = set(), set()
 
         for f in reversed(formats):
             vcodec, acodec = f.get("vcodec", "none"), f.get("acodec", "none")
@@ -82,20 +96,24 @@ async def get_info(url: str):
             "subtitles": {lang: lang for lang, subs in {**data.get("subtitles", {}), **data.get("automatic_captions", {})}.items() if subs},
         }
     except Exception as e:
-        print(f"DEBUG: Exception in get_info: {str(e)}")
+        print(f"CRITICAL EXCEPTION: {str(e)}")
         return JSONResponse({"error": str(e)}, status_code=500)
 
 @app.get("/download-file/{file_id}")
 async def serve_file(file_id: str):
-    if not re.match(r'^[a-f0-9\-]+$', file_id): return JSONResponse({"error": "Invalid ID"}, status_code=400)
+    if not re.match(r'^[a-f0-9\-]+$', file_id):
+        return JSONResponse({"error": "Invalid ID"}, status_code=400)
     job_dir = TEMP_DIR / file_id
-    if not job_dir.exists(): return JSONResponse({"error": "Not found"}, status_code=404)
+    if not job_dir.exists():
+        return JSONResponse({"error": "File not found"}, status_code=404)
     files = list(job_dir.iterdir())
-    if not files: return JSONResponse({"error": "No file"}, status_code=404)
+    if not files:
+        return JSONResponse({"error": "No file"}, status_code=404)
     
     async def cleanup():
-        await asyncio.sleep(20)
+        await asyncio.sleep(30) # Wait 30s to ensure download finishes before deleting
         shutil.rmtree(job_dir, ignore_errors=True)
+        
     asyncio.create_task(cleanup())
     return FileResponse(path=str(files[0]), filename=files[0].name)
 
@@ -113,10 +131,9 @@ async def download_ws(websocket: WebSocket):
         job_dir.mkdir(parents=True, exist_ok=True)
         output_template = str(job_dir / "%(title)s.%(ext)s")
 
-        # FIXED: Removed "-J" (JSON) and "--no-playlist" which were breaking the download here
         cmd = [
             YT_DLP, 
-            "--cookies", "cookies.txt", 
+            "--cookies", COOKIE_PATH, 
             "--no-check-certificates",
             "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "--newline", 
@@ -134,7 +151,11 @@ async def download_ws(websocket: WebSocket):
             else: cmd += ["-f", "bestvideo+bestaudio/best"]
             cmd += ["--merge-output-format", "mp4"]
 
-        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, 
+            stdout=asyncio.subprocess.PIPE, 
+            stderr=asyncio.subprocess.STDOUT
+        )
 
         async for line in proc.stdout:
             line = line.decode("utf-8", errors="replace").strip()
@@ -148,10 +169,16 @@ async def download_ws(websocket: WebSocket):
         await proc.wait()
         if proc.returncode == 0:
             files = list(job_dir.iterdir())
-            await websocket.send_json({"type": "done", "file_id": job_id, "filename": files[0].name if files else "download"})
+            if files:
+                await websocket.send_json({"type": "done", "file_id": job_id, "filename": files[0].name})
+            else:
+                await websocket.send_json({"type": "error", "message": "Download finished but no file found."})
         else:
-            await websocket.send_json({"type": "error", "message": "Download failed."})
+            await websocket.send_json({"type": "error", "message": "Download failed. check logs."})
 
     except Exception as e:
-        try: await websocket.send_json({"type": "error", "message": str(e)})
-        except: pass
+        print(f"WS EXCEPTION: {str(e)}")
+        try:
+            await websocket.send_json({"type": "error", "message": str(e)})
+        except:
+            pass
