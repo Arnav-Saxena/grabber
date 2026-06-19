@@ -14,7 +14,10 @@ from fastapi.staticfiles import StaticFiles
 
 app = FastAPI()
 
-YT_DLP = r"C:\Users\saxen\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\Scripts\yt-dlp.exe"
+import sys as _sys
+import shutil as _shutil2
+_WIN_YTDLP = r"C:\Users\saxen\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\Scripts\yt-dlp.exe"
+YT_DLP = _WIN_YTDLP if _sys.platform == "win32" else (_shutil2.which("yt-dlp") or "yt-dlp")
 
 # Temp dir for downloads — cleaned up after served
 TEMP_DIR = Path(tempfile.gettempdir()) / "ytdlp_serve"
