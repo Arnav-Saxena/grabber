@@ -3,32 +3,40 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import tempfile
 import uuid
 from pathlib import Path
+import yt_dlp
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 app = FastAPI()
 
-# --- 1. ROBUST COOKIE WRITING ---
+# --- 1. COOKIE SETUP ---
 COOKIE_PATH = "/tmp/cookies.txt"
 YT_COOKIES_STR = os.getenv("YT_COOKIES")
 
-def ensure_cookies():
+def get_ydl_opts(extra_opts=None):
     if YT_COOKIES_STR:
-        # Clean up the string to ensure it's a valid Netscape format
-        cleaned = YT_COOKIES_STR.replace('\\n', '\n').strip('"').strip("'")
         with open(COOKIE_PATH, "w", encoding="utf-8") as f:
-            f.write(cleaned)
-        return True
-    return False
+            f.write(YT_COOKIES_STR.replace('\\n', '\n').strip('"').strip("'"))
+    
+    opts = {
+        'cookiefile': COOKIE_PATH if YT_COOKIES_STR else None,
+        'quiet': True,
+        'no_warnings': True,
+        'nocheckcertificate': True,
+        # This is the "Magic" fix for 400 errors on Cloud Servers
+        'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    }
+    if extra_opts:
+        opts.update(extra_opts)
+    return opts
 
-# --- 2. SETUP PATHS ---
-# Force the linux path for Render
-YT_DLP = "yt-dlp" 
+# --- 2. LOGIC ---
 TEMP_DIR = Path(tempfile.gettempdir()) / "ytdlp_serve"
 TEMP_DIR.mkdir(exist_ok=True)
 
@@ -40,43 +48,23 @@ def index():
 
 @app.get("/info")
 async def get_info(url: str):
-    ensure_cookies()
     try:
-        # 3. SPOOFING AND VERBOSE LOGGING
-        cmd = [
-            YT_DLP, 
-            "--verbose",  # Forces detailed logs in Render
-            "--cookies", COOKIE_PATH,
-            "--no-check-certificates",
-            # This 'android' client argument is currently the best fix for 400 errors
-            "--extractor-args", "youtube:player-client=android,web",
-            "-J", 
-            "--no-playlist", 
-            url
-        ]
-        
-        print(f"LOG: Starting info fetch for {url}")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        
-        # This will print the FULL error to your Render dashboard
-        if result.returncode != 0:
-            print(f"CRITICAL ERROR FROM YT-DLP:\n{result.stderr}")
-            return JSONResponse({"error": "YouTube blocked the server. Check Render logs for details."}, status_code=400)
-
-        data = json.loads(result.stdout)
+        loop = asyncio.get_event_loop()
+        # Using the library directly instead of subprocess
+        with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
+            data = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=False))
+            
         formats = data.get("formats", [])
         video_formats, audio_formats = [], []
         seen_video, seen_audio = set(), set()
 
         for f in reversed(formats):
-            vcodec, acodec = f.get("vcodec", "none"), f.get("acodec", "none")
-            height, abr, fid, ext = f.get("height"), f.get("abr"), f.get("format_id"), f.get("ext", "")
-            if vcodec != "none" and height and height not in seen_video:
-                seen_video.add(height)
-                video_formats.append({"id": fid, "label": f"{height}p ({ext})", "height": height})
-            if acodec != "none" and vcodec == "none" and abr and round(abr) not in seen_audio:
-                seen_audio.add(round(abr))
-                audio_formats.append({"id": fid, "label": f"{round(abr)}kbps ({ext})", "abr": abr})
+            if f.get("vcodec") != "none" and f.get("height") and f["height"] not in seen_video:
+                seen_video.add(f["height"])
+                video_formats.append({"id": f["format_id"], "label": f"{f['height']}p ({f['ext']})", "height": f["height"]})
+            if f.get("acodec") != "none" and f.get("vcodec") == "none" and f.get("abr") and round(f["abr"]) not in seen_audio:
+                seen_audio.add(round(f["abr"]))
+                audio_formats.append({"id": f["format_id"], "label": f"{round(f['abr'])}kbps ({f['ext']})", "abr": f["abr"]})
 
         return {
             "title": data.get("title"),
@@ -85,61 +73,43 @@ async def get_info(url: str):
             "uploader": data.get("uploader"),
             "video_formats": sorted(video_formats, key=lambda x: -x["height"]),
             "audio_formats": sorted(audio_formats, key=lambda x: -x["abr"]),
-            "subtitles": {lang: lang for lang, subs in {**data.get("subtitles", {}), **data.get("automatic_captions", {})}.items() if subs},
         }
     except Exception as e:
-        print(f"EXCEPTION: {str(e)}")
-        return JSONResponse({"error": str(e)}, status_code=500)
+        # This will now show the REAL error on your phone screen
+        return JSONResponse({"error": str(e)}, status_code=400)
 
 @app.websocket("/ws/download")
 async def download_ws(websocket: WebSocket):
     await websocket.accept()
-    ensure_cookies()
     try:
         data = await websocket.receive_json()
-        url, format_id = data.get("url"), data.get("format_id")
-        audio_only, subtitle_only, subtitle_lang = data.get("audio_only"), data.get("subtitle_only"), data.get("subtitle_lang")
-
+        url = data.get("url")
         job_id = str(uuid.uuid4())
         job_dir = TEMP_DIR / job_id
         job_dir.mkdir(parents=True, exist_ok=True)
-        output_template = str(job_dir / "%(title)s.%(ext)s")
+        
+        def progress_hook(d):
+            if d['status'] == 'downloading':
+                asyncio.run_coroutine_threadsafe(
+                    websocket.send_json({"type": "progress", "percent": d.get('downloaded_bytes', 0) / d.get('total_bytes', 1) * 100}),
+                    asyncio.get_event_loop()
+                )
 
-        cmd = [
-            YT_DLP, 
-            "--cookies", COOKIE_PATH,
-            "--no-check-certificates",
-            "--extractor-args", "youtube:player-client=android,web",
-            "--newline", 
-            "-o", output_template, 
-            url
-        ]
+        ydl_opts = get_ydl_opts({
+            'format': f"{data.get('format_id')}+bestaudio/best" if not data.get('audio_only') else 'bestaudio',
+            'outtmpl': str(job_dir / "%(title)s.%(ext)s"),
+            'progress_hooks': [progress_hook],
+            'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3'} if data.get('audio_only') else {'key': 'FFmpegVideoConvertor','preferredformat': 'mp4'}],
+        })
 
-        if subtitle_only:
-            cmd += ["--skip-download", "--write-sub", "--write-auto-sub", "--sub-lang", subtitle_lang or "en", "--convert-subs", "srt"]
-        elif audio_only:
-            cmd += ["-x", "--audio-format", "mp3", "-f", format_id or "bestaudio"]
-        else:
-            cmd += ["-f", f"{format_id}+bestaudio/best" if format_id else "bestvideo+bestaudio/best", "--merge-output-format", "mp4"]
+        loop = asyncio.get_event_loop()
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            await loop.run_in_executor(None, lambda: ydl.download([url]))
 
-        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
-
-        async for line in proc.stdout:
-            line = line.decode("utf-8", errors="replace").strip()
-            pct_match = re.search(r"(\d+\.\d+)%", line)
-            if pct_match:
-                await websocket.send_json({"type": "progress", "percent": float(pct_match.group(1)), "line": line})
-            else:
-                await websocket.send_json({"type": "log", "line": line})
-
-        await proc.wait()
-        if proc.returncode == 0:
-            files = list(job_dir.iterdir())
-            await websocket.send_json({"type": "done", "file_id": job_id, "filename": files[0].name if files else "download"})
-        else:
-            await websocket.send_json({"type": "error", "message": "Download failed."})
+        files = list(job_dir.iterdir())
+        await websocket.send_json({"type": "done", "file_id": job_id, "filename": files[0].name})
     except Exception as e:
-        print(f"WS ERROR: {e}")
+        await websocket.send_json({"type": "error", "message": str(e)})
 
 @app.get("/download-file/{file_id}")
 async def serve_file(file_id: str):
