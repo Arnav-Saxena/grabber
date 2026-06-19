@@ -14,32 +14,38 @@ from fastapi.staticfiles import StaticFiles
 
 app = FastAPI()
 
+# --- COOKIE HANDLING ---
+# This reads the cookies from a Render Environment Variable named "YT_COOKIES"
+YT_COOKIES_CONTENT = os.getenv("YT_COOKIES")
+if YT_COOKIES_CONTENT:
+    with open("cookies.txt", "w") as f:
+        f.write(YT_COOKIES_CONTENT)
+
 import sys as _sys
 import shutil as _shutil2
-_WIN_YTDLP = r"C:\Users\saxen\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\Scripts\yt-dlp.exe"
-YT_DLP = _WIN_YTDLP if _sys.platform == "win32" else (_shutil2.which("yt-dlp") or "yt-dlp")
+# Improved path finding for yt-dlp
+YT_DLP = _shutil2.which("yt-dlp") or "yt-dlp"
 
-# Temp dir for downloads — cleaned up after served
 TEMP_DIR = Path(tempfile.gettempdir()) / "ytdlp_serve"
 TEMP_DIR.mkdir(exist_ok=True)
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-
 @app.get("/")
 def index():
     return FileResponse("static/index.html")
 
-
 @app.get("/info")
 async def get_info(url: str):
     try:
+        # Added --cookies cookies.txt to the command
+        cmd = [YT_DLP, "--cookies", "cookies.txt", "-J", "--no-playlist", url]
         result = subprocess.run(
-            [YT_DLP, "-J", "--no-playlist", url],
+            cmd,
             capture_output=True, text=True, timeout=30,
         )
         if result.returncode != 0:
-            return {"error": result.stderr or "Failed to fetch info"}
+            return JSONResponse({"error": result.stderr or "Failed to fetch info"}, status_code=400)
 
         data = json.loads(result.stdout)
         formats = data.get("formats", [])
@@ -82,17 +88,14 @@ async def get_info(url: str):
     except Exception as e:
         return {"error": str(e)}
 
-
 @app.get("/download-file/{file_id}")
 async def serve_file(file_id: str):
-    """Serve a completed download, then delete it."""
-    # security: only alphanumeric ids
     if not re.match(r'^[a-f0-9\-]+$', file_id):
         return JSONResponse({"error": "Invalid file id"}, status_code=400)
 
     job_dir = TEMP_DIR / file_id
     if not job_dir.exists():
-        return JSONResponse({"error": "File not found or already downloaded"}, status_code=404)
+        return JSONResponse({"error": "File not found"}, status_code=404)
 
     files = list(job_dir.iterdir())
     if not files:
@@ -101,17 +104,12 @@ async def serve_file(file_id: str):
     filepath = files[0]
 
     async def cleanup():
-        await asyncio.sleep(5)
+        await asyncio.sleep(10)
         shutil.rmtree(job_dir, ignore_errors=True)
 
     asyncio.create_task(cleanup())
 
-    return FileResponse(
-        path=str(filepath),
-        filename=filepath.name,
-        media_type="application/octet-stream",
-    )
-
+    return FileResponse(path=str(filepath), filename=filepath.name)
 
 @app.websocket("/ws/download")
 async def download_ws(websocket: WebSocket):
@@ -125,31 +123,23 @@ async def download_ws(websocket: WebSocket):
         audio_only = data.get("audio_only", False)
         subtitle_only = data.get("subtitle_only", False)
 
-        # Unique job folder
         job_id = str(uuid.uuid4())
         job_dir = TEMP_DIR / job_id
         job_dir.mkdir(parents=True, exist_ok=True)
 
         output_template = str(job_dir / "%(title)s.%(ext)s")
 
-        cmd = [YT_DLP, "--no-playlist", "--newline", "-o", output_template, url]
+        # Added --cookies cookies.txt to the WebSocket command
+        cmd = [YT_DLP, "--cookies", "cookies.txt", "--no-playlist", "--newline", "-o", output_template, url]
 
         if subtitle_only and subtitle_lang:
-            cmd += [
-                "--skip-download",
-                "--write-sub", "--write-auto-sub",
-                "--sub-lang", subtitle_lang,
-                "--convert-subs", "srt",
-            ]
+            cmd += ["--skip-download", "--write-sub", "--write-auto-sub", "--sub-lang", subtitle_lang, "--convert-subs", "srt"]
         elif audio_only:
             cmd += ["-x", "--audio-format", "mp3"]
-            if format_id:
-                cmd += ["-f", format_id]
+            if format_id: cmd += ["-f", format_id]
         else:
-            if format_id:
-                cmd += ["-f", f"{format_id}+bestaudio/best"]
-            else:
-                cmd += ["-f", "bestvideo+bestaudio/best"]
+            if format_id: cmd += ["-f", f"{format_id}+bestaudio/best"]
+            else: cmd += ["-f", "bestvideo+bestaudio/best"]
             cmd += ["--merge-output-format", "mp4"]
 
         proc = await asyncio.create_subprocess_exec(
@@ -160,16 +150,10 @@ async def download_ws(websocket: WebSocket):
 
         async for line in proc.stdout:
             line = line.decode("utf-8", errors="replace").strip()
-            if not line:
-                continue
-
+            if not line: continue
             pct_match = re.search(r"(\d+\.\d+)%", line)
             if pct_match:
-                await websocket.send_json({
-                    "type": "progress",
-                    "percent": float(pct_match.group(1)),
-                    "line": line,
-                })
+                await websocket.send_json({"type": "progress", "percent": float(pct_match.group(1)), "line": line})
             else:
                 await websocket.send_json({"type": "log", "line": line})
 
@@ -178,23 +162,12 @@ async def download_ws(websocket: WebSocket):
         if proc.returncode == 0:
             files = list(job_dir.iterdir())
             filename = files[0].name if files else "download"
-            await websocket.send_json({
-                "type": "done",
-                "file_id": job_id,
-                "filename": filename,
-            })
+            await websocket.send_json({"type": "done", "file_id": job_id, "filename": filename})
         else:
-            await websocket.send_json({"type": "error", "message": "Download failed. Check the URL."})
-            if job_dir:
-                shutil.rmtree(job_dir, ignore_errors=True)
+            await websocket.send_json({"type": "error", "message": "Download failed."})
 
     except WebSocketDisconnect:
-        if job_dir:
-            shutil.rmtree(job_dir, ignore_errors=True)
+        if job_dir: shutil.rmtree(job_dir, ignore_errors=True)
     except Exception as e:
-        try:
-            await websocket.send_json({"type": "error", "message": str(e)})
-        except:
-            pass
-        if job_dir:
-            shutil.rmtree(job_dir, ignore_errors=True)
+        try: await websocket.send_json({"type": "error", "message": str(e)})
+        except: pass
