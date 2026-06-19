@@ -15,17 +15,20 @@ from fastapi.staticfiles import StaticFiles
 app = FastAPI()
 
 # --- COOKIE HANDLING ---
-# This reads the cookies from a Render Environment Variable named "YT_COOKIES"
-YT_COOKIES_CONTENT = os.getenv("YT_COOKIES")
-if YT_COOKIES_CONTENT:
+# This creates the cookies.txt file from the Render environment variable
+YT_COOKIES_STR = os.getenv("YT_COOKIES")
+if YT_COOKIES_STR:
     with open("cookies.txt", "w") as f:
-        f.write(YT_COOKIES_CONTENT)
+        f.write(YT_COOKIES_STR)
 
 import sys as _sys
 import shutil as _shutil2
-# Improved path finding for yt-dlp
-YT_DLP = _shutil2.which("yt-dlp") or "yt-dlp"
 
+# Robust path finding
+_WIN_YTDLP = r"C:\Users\saxen\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\Scripts\yt-dlp.exe"
+YT_DLP = _WIN_YTDLP if _sys.platform == "win32" else (_shutil2.which("yt-dlp") or "yt-dlp")
+
+# Temp dir for downloads
 TEMP_DIR = Path(tempfile.gettempdir()) / "ytdlp_serve"
 TEMP_DIR.mkdir(exist_ok=True)
 
@@ -38,7 +41,7 @@ def index():
 @app.get("/info")
 async def get_info(url: str):
     try:
-        # Added --cookies cookies.txt to the command
+        # Added --cookies cookies.txt
         cmd = [YT_DLP, "--cookies", "cookies.txt", "-J", "--no-playlist", url]
         result = subprocess.run(
             cmd,
@@ -129,7 +132,7 @@ async def download_ws(websocket: WebSocket):
 
         output_template = str(job_dir / "%(title)s.%(ext)s")
 
-        # Added --cookies cookies.txt to the WebSocket command
+        # Added --cookies cookies.txt to the download command
         cmd = [YT_DLP, "--cookies", "cookies.txt", "--no-playlist", "--newline", "-o", output_template, url]
 
         if subtitle_only and subtitle_lang:
